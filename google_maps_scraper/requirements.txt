@@ -1,1 +1,0 @@
-playwright>=1.40 # Use a recent version 
