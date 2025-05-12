@@ -21,12 +21,17 @@ def remove_match_from_string(text, match_obj):
 
 async def scrape_google_maps(search_query: str):
     """
-    Scrapes Google Maps for a given search query, handling scrolling and extracting detailed data.
+    Scrapes Google Maps for a given search query, handling scrolling and extracting detailed data using page.evaluate for efficiency.
     """
     results = []
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=False)
         page = await browser.new_page()
+
+        # --- REMOVED: Resource Blocking ---
+        # await page.route("**/*", lambda route: route.abort() if route.request.resource_type in ["image", "font", "media"] else route.continue_())
+        # print("Resource blocking enabled for images, fonts, media.")
+        # -------------------------------
 
         # ADDED: Short delay before navigation to ensure page context is ready
         await asyncio.sleep(1)
@@ -56,7 +61,7 @@ async def scrape_google_maps(search_query: str):
         print("Waiting for search results...")
         results_panel_selector = 'div[role="feed"]'
         try:
-            await page.locator(results_panel_selector).first.wait_for(state="visible", timeout=30000)
+            await page.locator(results_panel_selector).first.wait_for(state="visible", timeout=60000)
             print("Search results loaded.")
         except Exception as e:
             print(f"Failed to load search results or timed out: {e}")
@@ -66,13 +71,12 @@ async def scrape_google_maps(search_query: str):
         # --- Scrolling Logic ---
         print("Scrolling to load all results...")
         scrollable_element = page.locator(results_panel_selector).first
-        # Selector for individual result items (needs careful inspection/adjustment)
-        result_item_selector = 'div.Nv2PK' # Try a common class name for result items
+        result_item_selector = 'div.Nv2PK' 
 
         previous_results_count = 0
         scroll_attempts = 0
-        max_scroll_attempts = 20 # Slightly increased max scrolls
-        consecutive_no_change = 0 # Track consecutive scrolls with no new results
+        max_scroll_attempts = 20 
+        consecutive_no_change = 0 
 
         while scroll_attempts < max_scroll_attempts:
             current_results_count = await page.locator(result_item_selector).count()
@@ -80,8 +84,9 @@ async def scrape_google_maps(search_query: str):
 
             if current_results_count == previous_results_count and scroll_attempts > 0:
                 consecutive_no_change += 1
-                end_marker_visible = await page.locator('span:has-text("You\'ve reached the end of the list.")').first.is_visible()
-                if end_marker_visible:
+                # Check for end marker (using .first for safety)
+                end_marker = page.locator('span:has-text("You\\\'ve reached the end of the list.")').first
+                if await end_marker.is_visible(timeout=1000): # Short timeout check
                     print("Reached the end of the list marker.")
                     break
 
@@ -90,191 +95,255 @@ async def scrape_google_maps(search_query: str):
                     break
                 else:
                     print(f"Result count unchanged ({consecutive_no_change} time(s)), waiting briefly...")
-                    await asyncio.sleep(1.5 + consecutive_no_change) # Slightly adjusted wait
-                    await scrollable_element.evaluate('(element) => element.scrollTop = element.scrollHeight')
-                    await asyncio.sleep(1.0) # Shorter wait after this specific scroll
+                    await asyncio.sleep(1.5 + consecutive_no_change) 
+                    # Scroll again
+                    try:
+                       await scrollable_element.evaluate('(element) => element.scrollTop = element.scrollHeight')
+                       await asyncio.sleep(1.0)
+                    except Exception as scroll_err:
+                       print(f"  Error during scroll attempt: {scroll_err}")
+                       break # Exit scroll loop if scrolling fails
             else:
-                # Reset counter if results were found
-                consecutive_no_change = 0
+                consecutive_no_change = 0 # Reset counter
 
             previous_results_count = current_results_count
-            await scrollable_element.evaluate('(element) => element.scrollTop = element.scrollHeight')
-            # Wait for potential new results to load after scroll
-            await asyncio.sleep(1.5) # Standard wait after scroll
+            try:
+                await scrollable_element.evaluate('(element) => element.scrollTop = element.scrollHeight')
+                await asyncio.sleep(1.5) # Standard wait after scroll
+            except Exception as scroll_err:
+                print(f"  Error during scroll attempt: {scroll_err}")
+                break # Exit scroll loop if scrolling fails
+                
             scroll_attempts += 1
             if scroll_attempts >= max_scroll_attempts:
                 print("Reached maximum scroll attempts.")
 
 
-        # --- Data Extraction ---
+        # --- Data Extraction (Refactored with page.evaluate) ---
         print(f"Scrolling finished. Extracting data from {previous_results_count} results...")
         result_elements = await page.locator(result_item_selector).all()
 
+        # JavaScript function to extract basic data from a result element
+        # This function runs in the browser context
+        js_extractor = """
+        (element) => {
+            const data = {
+                name: null,
+                rating_text: null, // Raw text like "4.5 stars" or just number
+                reviews_text: null, // Raw text like "(1,234)" - Parentheses included!
+                website_url: null, // ADDED Website URL
+                // REMOVED: info_text - will fetch separately in Python
+            };
+
+            // 1. Extract Name (using aria-label)
+            try {
+                data.name = element.querySelector('a[aria-label]')?.getAttribute('aria-label');
+            } catch (e) { /* Ignore JS Error (Name) */ }
+
+            // 2. Extract Rating/Review text (using potential selectors)
+            try {
+                const ratingSpan = element.querySelector('span[aria-label*="stars"]');
+                if (ratingSpan) {
+                   const fullRatingLabel = ratingSpan.ariaLabel || '';
+                   const ratingMatch = fullRatingLabel.match(/(\d\.\d)/);
+                   if (ratingMatch) data.rating_text = ratingMatch[1]; // Just the number
+                   
+                   // Check sibling or parent for review count in standard format (e.g., next span)
+                   const reviewSpan = ratingSpan.nextElementSibling; 
+                   if (reviewSpan && reviewSpan.textContent.match(/^\s*\(\s*\d{1,3}(?:[,.]\d{3})*\s*\)\s*$/)) {
+                       data.reviews_text = reviewSpan.textContent.trim(); // Get the text with parens
+                   } else {
+                       // Sometimes review count is inside the rating span's label itself
+                       const reviewMatchLabel = fullRatingLabel.match(/(\d{1,3}(?:[,.]\d{3})*)\s+reviews?/i);
+                       if (reviewMatchLabel) {
+                          data.reviews_text = '(' + reviewMatchLabel[1] + ')'; // Reconstruct standard format
+                       }
+                   }
+                }
+            } catch (e) { /* Ignore JS Error (Rating/Review) */ }
+            
+            // ADDED: Attempt to find website URL
+            try {
+                // Look for a button or link with aria-label="Website" or specific data-item-id
+                const websiteLink = element.querySelector('a[aria-label="Website"], a[data-item-id="authority"]');
+                if (websiteLink && websiteLink.href && !websiteLink.href.startsWith('https://www.google.com/maps')) {
+                    data.website_url = websiteLink.href;
+                }
+            } catch (e) { /* Ignore JS Error (Website) */ }
+            
+            return data;
+        }
+        """
+
         for i, element in enumerate(result_elements):
             print(f"--- Processing result item {i+1}/{len(result_elements)} ---")
-            # Initialize fields
-            name, rating, reviews, price_str, place_type, address, phone_number = ["N/A"] * 7
-            price_match_text, type_match_text, address_match_text = "", "", ""
-
-            # --- Name Extraction --- (Using the reliable aria-label selector)
-            name_selector = 'a[aria-label]'
+            
+            # Call the JavaScript extractor function for basic fields
             try:
-                name_element = element.locator(name_selector).first
-                name = await name_element.get_attribute('aria-label')
-                name = clean_text(name)
-                print(f"  Name found: {name}")
-            except Exception as e:
-                print(f"  Could not extract name: {e}")
-                name = "N/A"
-                # If name extraction fails, skip item - unlikely to get other fields correctly
+                extracted_data = await element.evaluate(js_extractor)
+            except Exception as eval_err:
+                print(f"  Error evaluating element {i+1}: {eval_err}")
+                continue 
+
+            # Initialize Python fields
+            name, rating, reviews, price_str, place_type, address, phone_number, website_url = ["N/A"] * 8
+            
+            # Use data returned from JavaScript
+            name = clean_text(extracted_data.get('name'))
+            rating = extracted_data.get('rating_text') or "N/A" # Rating is directly from JS now
+            reviews = clean_text(extracted_data.get('reviews_text')) or "N/A" # Reviews are directly from JS now
+            website_url = extracted_data.get('website_url') # Get from JS
+            
+            # --- Fetch Info Block Text using Python Locator ---
+            full_info_text_original = "" 
+            try:
+                info_elements = await element.locator('div.fontBodyMedium').all()
+                info_texts = [await el.text_content() for el in info_elements]
+                full_info_text_original = clean_text(' · '.join(filter(None, info_texts)))
+                print(f"  Fetched Info Block Text: '{full_info_text_original}'")
+            except Exception as info_err:
+                print(f"  Error fetching info block text: {info_err}")
+            
+            # Log initial data
+            print(f"  Name (JS): {name}")
+            print(f"  Rating (JS): {rating}")
+            print(f"  Reviews (JS): {reviews}")
+            print(f"  Website (JS): {website_url}") # Log JS website
+
+            # If name extraction failed in JS, skip item
+            if not name or name == "N/A":
+                print(f"  Skipping item {i+1} due to missing name.")
                 continue
-
-            # Extract from all info containers combined for better matching
-            info_container_selector = 'div.fontBodyMedium'
-            full_info_text_original = ""
-            try:
-                info_elements = await element.locator(info_container_selector).all()
-                all_texts = []
-                for info_el in info_elements:
-                    text_content = await info_el.text_content()
-                    if text_content:
-                        all_texts.append(clean_text(text_content))
-                full_info_text_original = " · ".join(all_texts) # Join with separator for parsing
-                print(f"  Raw Info Text: '{full_info_text_original}'")
-            except Exception as e:
-                print(f"  Error reading info containers: {e}")
-                # Continue processing even if text reading fails, might get name only
-
-            working_info_text = full_info_text_original
+            
+            # Start Python processing with the separately fetched info text
+            working_info_text = full_info_text_original 
 
             try:
-                # 1. Extract Rating
-                rating_match = re.search(r'(\d\.\d)', working_info_text)
-                if rating_match:
-                    rating = rating_match.group(1)
-                    # Safely remove from working text
-                    working_info_text = remove_match_from_string(working_info_text, rating_match)
+                # --- Python Regex Processing --- 
+                
+                # Remove rating/review numbers if they appear verbatim in the info text
+                # (They shouldn't typically, but as a safety measure)
+                if rating != "N/A" and rating in working_info_text:
+                    working_info_text = working_info_text.replace(rating, "", 1)
+                if reviews != "N/A" and reviews in working_info_text:
+                    working_info_text = working_info_text.replace(reviews, "", 1)
+                
+                working_info_text = clean_text(working_info_text)
 
-                # 2. Extract Reviews
-                reviews_match = re.search(r'(\(\s*\d{1,3}(?:[,.]\d{3})*\s*\))', working_info_text)
-                if reviews_match:
-                    reviews = clean_text(reviews_match.group(1))
-                    working_info_text = remove_match_from_string(working_info_text, reviews_match)
-
-                # 3. Extract Price (Revised Logic - Swapped Order)
+                # --- Price Extraction (Simplified Logic) ---
                 print(f"    Text for Price: '{working_info_text}'")
                 price_str = "N/A" # Default
-                price_match = None
+                price_match_broad = None
 
-                # Pattern 1: Try symbol followed by numbers/range first (e.g., £20-40, $100+)
-                # Reverted: Broader match, will rely on post-processing
-                price_regex_num = r'([£$€₹¥฿][\s]*[\d,.-–+]+)' # Symbol, optional space, digits/commas/dots/hyphens/en-dash/plus
-                price_match = re.search(price_regex_num, working_info_text, re.IGNORECASE)
-                if price_match:
-                    potential_price = clean_text(price_match.group(1))
-                    print(f"    Price Matched (Num - Raw): '{price_match.group(0)}', Potential: '{potential_price}'")
-                    # Post-processing: Trim trailing non-numeric/non-symbol chars (like letters)
+                # Pattern 1: Try symbol followed by numbers/range/plus (potentially greedy)
+                price_regex_num_broad = r'([£$€₹¥฿][\s]*[\d,.-–+]+)' 
+                price_match_broad = re.search(price_regex_num_broad, working_info_text, re.IGNORECASE)
+                
+                if price_match_broad:
+                    potential_price_str = price_match_broad.group(1) # e.g., "€20–30French"
+                    print(f"    Price Matched (Broad): '{potential_price_str}'")
+                    
+                    # Pattern 1a: Extract ONLY the valid price part from the start of the broad match
                     # Revised cleaning regex to be more specific about valid price structures
-                    cleaned_price_match = re.match(r'([£$€₹¥฿][\s]*(?:[\d.,]+(?:[–-][\d.,]+)?|[£$€₹¥฿]{0,2})\+?)', potential_price)
-                    if cleaned_price_match:
-                        # Check if the entire potential_price was matched by the cleaning regex or if there are trailing characters
-                        if cleaned_price_match.group(0) == potential_price or potential_price[len(cleaned_price_match.group(0)):].isspace():
-                            price_str = cleaned_price_match.group(1).strip()
-                            print(f"    Price Post-Processed (Clean Match): '{price_str}'")
-                        else:
-                            # The cleaning regex matched a part, but there was other non-space stuff after it in potential_price
-                            # This case implies the initial broad match was too greedy and included non-price text
-                            # For example, potential_price = "£20-30Italian", cleaned_match = "£20-30"
-                            # We should use the cleaned match.
-                            price_str = cleaned_price_match.group(1).strip()
-                            print(f"    Price Post-Processed (Partial Cleaned): '{price_str}', Trailing: '{potential_price[len(cleaned_price_match.group(0)):]}'")
+                    price_regex_num_clean = r'^([£$€₹¥฿][\s]*(?:[\d.,]+(?:[–-][\d.,]+)?|[£$€₹¥฿]{0,2})\+?)' # More structured cleaning
+                    price_match_clean = re.match(price_regex_num_clean, potential_price_str, re.IGNORECASE) # Match from start
+                    if price_match_clean:
+                        price_str = clean_text(price_match_clean.group(1))
+                        print(f"    Price Extracted (Cleaned Num): '{price_str}'")
+                        working_info_text = remove_match_from_string(working_info_text, price_match_broad) # Remove original broad match
                     else:
-                        price_str = "N/A" # If cleaning fails, reset
-                        print(f"    Price Post-Processing Failed for: '{potential_price}'")
-                else:
-                    # Pattern 2: Try symbol-only as fallback (e.g., $, ££, $$$)
-                    price_regex_sym = r'([£$€₹¥฿]{1,4})' # Match 1 to 4 currency symbols 
-                    price_match = re.search(price_regex_sym, working_info_text)
-                    if price_match:
-                        price_str = clean_text(price_match.group(1))
-                        # No complex post-processing needed here, symbols are simple
-                        print(f"    Price Matched (Sym): '{price_match.group(0)}', Extracted: '{price_str}'")
+                         print(f"    Cleaned Num Extraction Failed for: '{potential_price_str}'")
+                         # Fall through to symbol check if clean extraction fails
 
-                # Final cleanup removed, handled in post-processing logic above
+                # Fallback / Pattern 2: If numeric pattern didn't yield a clean price, try symbol-only
+                if price_str == "N/A":
+                    price_regex_sym = r'([£$€₹¥฿]{1,4})'
+                    price_match_sym = re.search(price_regex_sym, working_info_text)
+                    if price_match_sym:
+                        price_str = clean_text(price_match_sym.group(1))
+                        print(f"    Price Matched (Sym): '{price_match_sym.group(0)}', Extracted: '{price_str}'")
+                        working_info_text = remove_match_from_string(working_info_text, price_match_sym)
 
-                if price_match and price_str != "N/A":
-                    # Use the original match object span for removal, even if we post-processed the string
-                    working_info_text = remove_match_from_string(working_info_text, price_match)
-
-                # 4. Extract Phone Number (from original text)
+                # 4. Extract Phone Number (from original text - unchanged)
                 phone_regex = r'(\+\d{1,4}[ \-]?(\(?\d{2,4}\)?|[\d]{2,4})[ \-]?\d{3,}[\s-]?\d{3,})'
-                phone_match = re.search(phone_regex, full_info_text_original)
+                phone_match = re.search(phone_regex, full_info_text_original) # Use original text here
                 if phone_match:
                     phone_number = clean_text(phone_match.group(1))
                     print(f"    Phone Matched: '{phone_number}'")
-                    # Also try to remove from working text, carefully
+                    # Remove from working text if present
                     try:
                        working_info_text = re.sub(re.escape(phone_match.group(0)), '', working_info_text, count=1)
-                    except re.error: # Handle potential regex errors from complex phone numbers
-                        working_info_text = working_info_text.replace(phone_match.group(0), "") # Fallback
+                    except re.error:
+                        working_info_text = working_info_text.replace(phone_match.group(0), "")
                    
-                # Clean working text after removals
+                # Clean working text
                 working_info_text = clean_text(working_info_text.replace('· ·', '·').strip(' ·'))
                 print(f"  Text for Type/Address: '{working_info_text}'")
 
-                # 5. Extract Type (Keywords first)
-                known_types = ["Restaurant", "Cafe", "Bar", "Pub", "Hotel", "Steakhouse", "Steak", "Chophouse", "Pakistani", "Indian", "Chinese", "Italian", "Thai", "Japanese", "Mexican", "Greek", "Turkish", "Lebanese", "Brunch", "Bakery", "Dessert", "Coffee", "Tea", "Fast Food", "Fine Dining", "Barbecue"]
+                # 5. Extract Type
+                # Reordered Known Types (more specific first) + Re-added Word Boundaries
+                known_types = [
+                    # More specific first
+                    "Used book store", "Comic book store", "Rare book store", 
+                    # General bookstore
+                    "Book store", 
+                    # Other common types
+                    "Restaurant", "Cafe", "Bar", "Pub", "Hotel", "Steakhouse", "Steak", 
+                    "Chophouse", "Pakistani", "Indian", "Chinese", "Italian", "Thai", 
+                    "Japanese", "Mexican", "Greek", "Turkish", "Lebanese", "Brunch", 
+                    "Bakery", "Dessert", "Coffee", "Tea", "Fast Food", "Fine Dining", "Barbecue"
+                ]
                 type_found = False
                 for k_type in known_types:
-                    # Use word boundaries for safer matching
-                    # Moved try-except inside the loop to handle individual regex errors gracefully
                     try:
-                        type_match_obj = re.search(r'\b{}\b'.format(re.escape(k_type)), working_info_text, re.IGNORECASE)
+                        # RE-ADDED word boundaries \b for accuracy
+                        type_match_obj = re.search(r'\\b{}\\b'.format(re.escape(k_type)), working_info_text, re.IGNORECASE)
                         if type_match_obj:
                             place_type = k_type # Use the canonical form
                             print(f"    Type Found (Keyword): '{place_type}', Match: '{type_match_obj.group(0)}'")
                             working_info_text = remove_match_from_string(working_info_text, type_match_obj)
                             type_found = True
                             break
-                    except re.error: # Skip type if regex fails
+                    except re.error:
                         print(f"    Regex error matching type: {k_type}")
-                        continue # Continue to the next type keyword
+                        continue
                        
                 if not type_found:
                     print(f"    Type not found via keywords.")
-                    # Consider removing fallback logic entirely if it wasn't reliable
 
-                # Clean text again before address extraction
+                # Clean text again
                 working_info_text = clean_text(working_info_text.strip(' ·'))
                 print(f"  Text for Address: '{working_info_text}'")
 
-                # 6. Extract Address (Remaining text after cleaning hours from the end)
+                # 6. Extract Address (Remaining text - unchanged)
                 if working_info_text:
-                    address = re.sub(r'(\s*·\s*)?(Open|Closed|Closes|Opening|Hours|Serves|Delivers|Takeout|Dine-in|Pickup|Delivery|Offers|Ends|Starts|Temporary|Permanently).*$', '', working_info_text, flags=re.IGNORECASE).strip()
+                    address = re.sub(r'(\\s*·\\s*)?(Open|Closed|Closes|Opening|Hours|Serves|Delivers|Takeout|Dine-in|Pickup|Delivery|Offers|Ends|Starts|Temporary|Permanently).*$', '', working_info_text, flags=re.IGNORECASE).strip()
                     address = clean_text(address)
                     if not address or len(address) < 5: 
                         address = "N/A" 
                
-                # Final sanity checks
-                if place_type == address : place_type = "N/A" # If type ended up same as address, clear type
+                # Final sanity checks (unchanged)
+                if place_type == address : place_type = "N/A" 
                 if not place_type or place_type.isdigit(): place_type = "N/A"
                 if not address or address.isdigit(): address = "N/A"
+                if not website_url: website_url = "N/A" # Ensure N/A if not found
 
             except Exception as e:
-                print(f"  Error during detailed info extraction: {e}")
+                print(f"  Error during detailed Python info extraction: {e}")
                 # Ensure all fields have a default
-                name, rating, reviews, price_str, place_type, address, phone_number = \
+                name, rating, reviews, price_str, place_type, address, phone_number, website_url = \
                     map(lambda x: x if x != "N/A" else "N/A", \
-                        [name, rating, reviews, price_str, place_type, address, phone_number])
+                        [name, rating, reviews, price_str, place_type, address, phone_number, website_url])
 
             result_data = {
-                "Name": name, # Capitalized keys for output
+                "Name": name, 
                 "Rating": rating,
                 "Reviews": reviews,
                 "Price": price_str,
                 "Type": place_type,
                 "Address": address,
-                "Phone Number": phone_number
+                "Phone Number": phone_number,
+                "Website": website_url
             }
             results.append(result_data)
             print(f"  -> Appended: {result_data}")
@@ -284,33 +353,28 @@ async def scrape_google_maps(search_query: str):
         return results
 
 async def main():
-    # --- Argument Parsing --- ADDED
+    # --- Argument Parsing ---
     parser = argparse.ArgumentParser(description="Scrape Google Maps for a search query.")
     parser.add_argument("search_query", help="The search query (e.g., 'restaurants in London', 'cafes in Paris')")
     args = parser.parse_args()
 
-    # --- User Input ---
-    # search_query = "restaurants in London" # REMOVED: Hardcoded query
-    search_query = args.search_query # Use the argument
+    search_query = args.search_query 
     print(f"Starting scraper for: {search_query}")
 
     scraped_data = await scrape_google_maps(search_query)
 
     if scraped_data:
         print("\n--- Extracted Data ---")
-        # Import pandas just for display, if available. Otherwise print manually.
         try:
             import pandas as pd
-            # Ensure consistent column order
-            df = pd.DataFrame(scraped_data, columns=["Name", "Rating", "Reviews", "Price", "Type", "Address", "Phone Number"])
+            df = pd.DataFrame(scraped_data, columns=["Name", "Rating", "Reviews", "Price", "Type", "Address", "Phone Number", "Website"])
             print(df.to_string())
         except ImportError:
             print("Pandas not installed. Printing manually:")
             for i, place in enumerate(scraped_data):
                  print(f"\n--- Result {i+1} ---")
-                 # Print in specific order
-                 for key in ["Name", "Rating", "Reviews", "Price", "Type", "Address", "Phone Number"]:
-                     value = place.get(key, "N/A") # Use .get for safety
+                 for key in ["Name", "Rating", "Reviews", "Price", "Type", "Address", "Phone Number", "Website"]:
+                     value = place.get(key, "N/A") 
                      print(f"  {key}: {value}")
         print(f"\n----------------------\nTotal: {len(scraped_data)} places")
     else:
